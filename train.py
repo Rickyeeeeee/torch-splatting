@@ -102,7 +102,7 @@ if __name__ == "__main__":
         train_lr=1e-3, 
         amp=False,
         fp16=False,
-        results_folder='result/test',
+        results_folder='result/2dgs',
         render_kwargs=render_kwargs,
     )
 

@@ -2,7 +2,7 @@ import pdb
 import torch
 import torch.nn as nn
 import math
-from einops import reduce
+from einops import reduce, rearrange
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -14,6 +14,12 @@ def homogeneous(points):
     """
     return torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
 
+def homogeneous_vec(vec):
+    """
+    homogeneous points
+    :param points: [..., 3]
+    """
+    return torch.cat([vec, torch.zeros_like(vec[..., :1])], dim=-1)
 
 def build_rotation(r):
     norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
@@ -75,6 +81,10 @@ def build_covariance_3d(s, r):
     # symm = strip_symmetric(actual_covariance)
     # return symm
 
+def build_covariance_3d_2dgs(s, r):
+    L = build_scaling_rotation(torch.cat([s, torch.ones(s.shape[0], 1, device=s.device)], dim=1), r)
+    actual_covariance = L @ L.transpose(1, 2)
+    return actual_covariance
 
 
 def build_covariance_2d(
@@ -111,6 +121,18 @@ def build_covariance_2d(
     filter = torch.eye(2,2).to(cov2d) * 0.3
     return cov2d[:, :2, :2] + filter[None]
 
+def build_transforms(means3D, scales, rotations, viewmatrix, projmatrix):
+    transforms = build_covariance_3d_2dgs(scales, rotations)
+    p_view = means3D @ viewmatrix[:3,:3] + viewmatrix[-1:,:3]
+    uv_view = transforms @ viewmatrix[:3,:3]
+    M = torch.cat(
+        [
+            homogeneous_vec(uv_view[:,:2,:]),
+            homogeneous(p_view.unsqueeze(1))
+        ],
+        dim=1) # M
+    T = M @ projmatrix
+    return T
 
 def projection_ndc(points, viewmatrix, projmatrix):
     points_o = homogeneous(points) # object space
@@ -169,9 +191,9 @@ def get_radius(transforms, cutoff=3.0, filterSize=0.707106):
         h = torch.sqrt(torch.clamp(h0, min=1e-4))
         extent = h
 
-        r = torch.ceil(torch.max(
+        r = torch.ceil(torch.clamp(
             torch.max(extent[:, 0], extent[:, 1]),
-            cutoff * filterSize
+            min=cutoff * filterSize
         ))
 
         radius[valid] = r
@@ -273,7 +295,7 @@ class Gauss2DRenderer(nn.Module):
         }
 
     def render(self, camera, means2D, transforms, color, opacity, depths):
-        radii, point_image = get_radius(transforms, filterSize=self.filterSize) # Fix this
+        radii, point_image = get_radius(transforms[..., :3], filterSize=self.filterSize) # Fix this
         rect = get_rect(point_image, radii, width=camera.image_width, height=camera.image_height)
 
         self.render_color = torch.ones(*self.pix_coord.shape[:2], 3).to('cuda')
@@ -302,21 +324,26 @@ class Gauss2DRenderer(nn.Module):
                 # Compute Gaussian weights (gauss_weight) for each pixel in tile_coord and each Gaussian
 
                 # Prepare components
-                Tu = sorted_transforms[:, 0, :]  # shape: (P, 3)
-                Tv = sorted_transforms[:, 1, :]
-                Tw = sorted_transforms[:, 2, :]
+                Tu = sorted_transforms[..., 0]  # shape: (P, 3)
+                Tv = sorted_transforms[..., 1]
+                Tw = sorted_transforms[..., 3]
 
                 pix = tile_coord  # shape: (B, 2)
                 P = sorted_transforms.shape[0]
                 B = pix.shape[0]
 
                 # Project each pixel using Tu, Tv, Tw and compute p = k x l (cross product)
-                pix_x = pix[:, 0].unsqueeze(1)  # shape: (B, 1)
-                pix_y = pix[:, 1].unsqueeze(1)
+                pix_x = pix[:, 0]  # shape: (B, 1)
+                pix_y = pix[:, 1]
 
                 # Compute planes
-                k = pix_x * Tw.unsqueeze(0) - Tu.unsqueeze(0)  # shape: (B, P, 3)
-                l = pix_y * Tw.unsqueeze(0) - Tv.unsqueeze(0)  # shape: (B, P, 3)
+                Tu = rearrange(Tu, 'P u -> 1 P u')  # shape: (P, 1, 3)
+                Tv = rearrange(Tv, 'P v -> 1 P v')  # shape: (P, 1, 3)
+                Tw = rearrange(Tw, 'P w -> 1 P w')  # shape: (P, 1, 3)
+                pix_x = rearrange(pix_x, 'B -> B 1 1')  # shape: (B, 1, 1)
+                pix_y = rearrange(pix_y, 'B -> B 1 1')  # shape: (B, 1, 1)
+                k = pix_x * Tw - Tu  # shape: (B, P, 3)
+                l = pix_y * Tw - Tv  # shape: (B, P, 3)
 
                 # Cross product (k x l)
                 px = k[...,1]*l[...,2] - k[...,2]*l[...,1]
@@ -384,27 +411,45 @@ class Gauss2DRenderer(nn.Module):
             color = self.build_color(means3D=means3D, shs=shs, camera=camera)
         
         with prof("build cov3d"):
-            cov3d = build_covariance_3d(scales, rotations)
+            T = build_transforms(
+                means3D=means3D[in_mask], 
+                scales=scales[in_mask], 
+                rotations=rotations[in_mask],
+                viewmatrix=camera.world_view_transform, 
+                projmatrix=camera.projection_matrix
+            )
             
-        with prof("build cov2d"):
-            cov2d = build_covariance_2d(
-                mean3d=means3D, 
-                cov3d=cov3d, 
-                viewmatrix=camera.world_view_transform,
-                fov_x=camera.FoVx, 
-                fov_y=camera.FoVy, 
-                focal_x=camera.focal_x, 
-                focal_y=camera.focal_y)
+        # with prof("build cov2d"):
+        #     cov2d = build_covariance_2d(
+        #         mean3d=means3D, 
+        #         cov3d=cov3d, 
+        #         viewmatrix=camera.world_view_transform,
+        #         fov_x=camera.FoVx, 
+        #         fov_y=camera.FoVy, 
+        #         focal_x=camera.focal_x, 
+        #         focal_y=camera.focal_y)
 
-            mean_coord_x = ((mean_ndc[..., 0] + 1) * camera.image_width - 1.0) * 0.5
-            mean_coord_y = ((mean_ndc[..., 1] + 1) * camera.image_height - 1.0) * 0.5
-            means2D = torch.stack([mean_coord_x, mean_coord_y], dim=-1)
+        #     mean_coord_x = ((mean_ndc[..., 0] + 1) * camera.image_width - 1.0) * 0.5
+        #     mean_coord_y = ((mean_ndc[..., 1] + 1) * camera.image_height - 1.0) * 0.5
+        #     means2D = torch.stack([mean_coord_x, mean_coord_y], dim=-1)
         
+        # with prof("render"):
+        #     rets = self.render_old(
+        #         camera = camera, 
+        #         means2D=means2D,
+        #         cov2d=cov2d,
+        #         color=color,
+        #         opacity=opacity, 
+        #         depths=depths,
+        #     )
+
         with prof("render"):
-            rets = self.render_old(
-                camera = camera, 
+            transforms = T
+            means2D = mean_ndc[:, :2]
+            rets = self.render(
+                camera=camera, 
                 means2D=means2D,
-                cov2d=cov2d,
+                transforms=transforms,
                 color=color,
                 opacity=opacity, 
                 depths=depths,
