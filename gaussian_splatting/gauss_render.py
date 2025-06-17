@@ -123,12 +123,61 @@ def projection_ndc(points, viewmatrix, projmatrix):
 
 
 @torch.no_grad()
-def get_radius(cov2d):
+def get_radius_old(cov2d):
     det = cov2d[:, 0, 0] * cov2d[:,1,1] - cov2d[:, 0, 1] * cov2d[:,1,0]
     mid = 0.5 * (cov2d[:, 0,0] + cov2d[:,1,1])
     lambda1 = mid + torch.sqrt((mid**2-det).clip(min=0.1))
     lambda2 = mid - torch.sqrt((mid**2-det).clip(min=0.1))
     return 3.0 * torch.sqrt(torch.max(lambda1, lambda2)).ceil()
+
+@torch.no_grad()
+def get_radius(transforms, cutoff=3.0, filterSize=0.707106):
+    """
+    Args:
+        transforms: Tensor of shape (n, 3, 3)
+        cutoff: Scalar cutoff value
+        FilterSize: Scalar value to scale the cutoff
+
+    Returns:
+        radius: Tensor of shape (n,) with computed radius
+        point_image: Tensor of shape (n, 2) with computed center
+    """
+    t = torch.tensor([cutoff**2, cutoff**2, -1.0], device=transforms.device)
+    T0 = transforms[:, 0, :]  # shape: (n, 3)
+    T1 = transforms[:, 1, :]
+    T2 = transforms[:, 2, :]
+
+    d = torch.sum(t * (T2 * T2), dim=1)  # shape: (n,)
+    valid = d != 0
+
+    radius = torch.zeros(transforms.shape[0], device=transforms.device)
+    point_image = torch.zeros((transforms.shape[0], 2), device=transforms.device)
+
+    if valid.any():
+        f = (1.0 / d[valid]).unsqueeze(1) * t  # shape: (nv, 3)
+        p_x = torch.sum(f * (T0[valid] * T2[valid]), dim=1)
+        p_y = torch.sum(f * (T1[valid] * T2[valid]), dim=1)
+        p = torch.stack([p_x, p_y], dim=1)
+
+        dot00 = torch.sum(f * (T0[valid] * T0[valid]), dim=1)
+        dot11 = torch.sum(f * (T1[valid] * T1[valid]), dim=1)
+
+        h0_x = p_x * p_x - dot00
+        h0_y = p_y * p_y - dot11
+        h0 = torch.stack([h0_x, h0_y], dim=1)
+
+        h = torch.sqrt(torch.clamp(h0, min=1e-4))
+        extent = h
+
+        r = torch.ceil(torch.max(
+            torch.max(extent[:, 0], extent[:, 1]),
+            cutoff * filterSize
+        ))
+
+        radius[valid] = r
+        point_image[valid] = p
+
+    return radius, point_image
 
 @torch.no_grad()
 def get_rect(pix_coord, radii, width, height):
@@ -146,7 +195,7 @@ import torch.autograd.profiler as profiler
 USE_PROFILE = False
 import contextlib
 
-class GaussRenderer(nn.Module):
+class Gauss2DRenderer(nn.Module):
     """
     A gaussian splatting renderer
 
@@ -156,11 +205,12 @@ class GaussRenderer(nn.Module):
     """
 
     def __init__(self, active_sh_degree=3, white_bkgd=True, **kwargs):
-        super(GaussRenderer, self).__init__()
+        super(Gauss2DRenderer, self).__init__()
         self.active_sh_degree = active_sh_degree
         self.debug = False
         self.white_bkgd = white_bkgd
         self.pix_coord = torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256), indexing='xy'), dim=-1).to('cuda')
+        self.filterSize = 0.707106
         
     
     def build_color(self, means3D, shs, camera):
@@ -170,8 +220,8 @@ class GaussRenderer(nn.Module):
         color = (color + 0.5).clip(min=0.0)
         return color
     
-    def render(self, camera, means2D, cov2d, color, opacity, depths):
-        radii = get_radius(cov2d)
+    def render_old(self, camera, means2D, cov2d, color, opacity, depths):
+        radii = get_radius_old(cov2d)
         rect = get_rect(means2D, radii, width=camera.image_width, height=camera.image_height)
         
         self.render_color = torch.ones(*self.pix_coord.shape[:2], 3).to('cuda')
@@ -222,6 +272,93 @@ class GaussRenderer(nn.Module):
             "radii": radii
         }
 
+    def render(self, camera, means2D, transforms, color, opacity, depths):
+        radii, point_image = get_radius(transforms, filterSize=self.filterSize) # Fix this
+        rect = get_rect(point_image, radii, width=camera.image_width, height=camera.image_height)
+
+        self.render_color = torch.ones(*self.pix_coord.shape[:2], 3).to('cuda')
+        self.render_depth = torch.zeros(*self.pix_coord.shape[:2], 1).to('cuda')
+        self.render_alpha = torch.zeros(*self.pix_coord.shape[:2], 1).to('cuda')
+
+        TILE_SIZE = 64
+        for h in range(0, camera.image_height, TILE_SIZE):
+            for w in range(0, camera.image_width, TILE_SIZE):
+                # check if the rectangle penetrate the tile
+                over_tl = rect[0][..., 0].clip(min=w), rect[0][..., 1].clip(min=h)
+                over_br = rect[1][..., 0].clip(max=w+TILE_SIZE-1), rect[1][..., 1].clip(max=h+TILE_SIZE-1)
+                in_mask = (over_br[0] > over_tl[0]) & (over_br[1] > over_tl[1])
+
+                if not in_mask.sum() > 0:
+                    continue
+
+                P = in_mask.sum()
+                tile_coord = self.pix_coord[h:h+TILE_SIZE, w:w+TILE_SIZE].flatten(0,-2)
+                sorted_depths, index = torch.sort(depths[in_mask])
+                sorted_means2D = means2D[in_mask][index]
+                sorted_transforms = transforms[in_mask][index] # P 2 2
+                sorted_opacity = opacity[in_mask][index]
+                sorted_color = color[in_mask][index]
+
+                # Compute Gaussian weights (gauss_weight) for each pixel in tile_coord and each Gaussian
+
+                # Prepare components
+                Tu = sorted_transforms[:, 0, :]  # shape: (P, 3)
+                Tv = sorted_transforms[:, 1, :]
+                Tw = sorted_transforms[:, 2, :]
+
+                pix = tile_coord  # shape: (B, 2)
+                P = sorted_transforms.shape[0]
+                B = pix.shape[0]
+
+                # Project each pixel using Tu, Tv, Tw and compute p = k x l (cross product)
+                pix_x = pix[:, 0].unsqueeze(1)  # shape: (B, 1)
+                pix_y = pix[:, 1].unsqueeze(1)
+
+                # Compute planes
+                k = pix_x * Tw.unsqueeze(0) - Tu.unsqueeze(0)  # shape: (B, P, 3)
+                l = pix_y * Tw.unsqueeze(0) - Tv.unsqueeze(0)  # shape: (B, P, 3)
+
+                # Cross product (k x l)
+                px = k[...,1]*l[...,2] - k[...,2]*l[...,1]
+                py = k[...,2]*l[...,0] - k[...,0]*l[...,2]
+                pz = k[...,0]*l[...,1] - k[...,1]*l[...,0]
+                p = torch.stack([px, py, pz], dim=-1)  # shape: (B, P, 3)
+
+                # Avoid division by zero
+                mask = p[..., 2] != 0
+                p[..., 2] = torch.where(mask, p[..., 2], torch.ones_like(p[..., 2]))
+
+                # s = p.xy / p.z
+                s = p[..., :2] / p[..., 2:3]  # shape: (B, P, 2)
+                rho3d = (s**2).sum(dim=-1)  # shape: (B, P)
+
+                # 2D distance term
+                xy = sorted_means2D  # shape: (P, 2)
+                pixf = pix.unsqueeze(1)  # shape: (B, 1, 2)
+                d = xy.unsqueeze(0) - pixf  # shape: (B, P, 2)
+                rho2d = (d**2).sum(dim=-1) * (1.0 / (self.filterSize**2))
+
+                # Combine them
+                rho = torch.minimum(rho3d, rho2d)  # shape: (B, P)
+                gauss_weight = torch.exp(-0.5 * rho)  # shape: (B, P)
+
+                # Not the same as the original code
+                alpha = (gauss_weight[..., None] * sorted_opacity[None]).clip(max=0.99) # B P 1
+                T = torch.cat([torch.ones_like(alpha[:,:1]), 1-alpha[:,:-1]], dim=1).cumprod(dim=1)
+                acc_alpha = (alpha * T).sum(dim=1)
+                tile_color = (T * alpha * sorted_color[None]).sum(dim=1) + (1-acc_alpha) * (1 if self.white_bkgd else 0)
+                tile_depth = ((T * alpha) * sorted_depths[None,:,None]).sum(dim=1)
+                self.render_color[h:h+TILE_SIZE, w:w+TILE_SIZE] = tile_color.reshape(TILE_SIZE, TILE_SIZE, -1)
+                self.render_depth[h:h+TILE_SIZE, w:w+TILE_SIZE] = tile_depth.reshape(TILE_SIZE, TILE_SIZE, -1)
+                self.render_alpha[h:h+TILE_SIZE, w:w+TILE_SIZE] = acc_alpha.reshape(TILE_SIZE, TILE_SIZE, -1)
+
+        return {
+            "render": self.render_color,
+            "depth": self.render_depth,
+            "alpha": self.render_alpha,
+            "visiility_filter": radii > 0,
+            "radii": radii
+        }
 
     def forward(self, camera, pc, **kwargs):
         means3D = pc.get_xyz
@@ -264,7 +401,7 @@ class GaussRenderer(nn.Module):
             means2D = torch.stack([mean_coord_x, mean_coord_y], dim=-1)
         
         with prof("render"):
-            rets = self.render(
+            rets = self.render_old(
                 camera = camera, 
                 means2D=means2D,
                 cov2d=cov2d,

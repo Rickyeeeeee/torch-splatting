@@ -6,8 +6,8 @@ import gaussian_splatting.utils.loss_utils as loss_utils
 from gaussian_splatting.utils.data_utils import read_all
 from gaussian_splatting.utils.camera_utils import to_viewpoint_camera
 from gaussian_splatting.utils.point_utils import get_point_clouds
-from gaussian_splatting.gauss_model import GaussModel
-from gaussian_splatting.gauss_render import GaussRenderer
+from gaussian_splatting.gauss_model import Gauss2DModel
+from gaussian_splatting.gauss_render import Gauss2DRenderer
 
 import contextlib
 
@@ -20,7 +20,7 @@ class GSSTrainer(Trainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.data = kwargs.get('data')
-        self.gaussRender = GaussRenderer(**kwargs.get('render_kwargs', {}))
+        self.gaussRender = Gauss2DRenderer(**kwargs.get('render_kwargs', {}))
         self.lambda_dssim = 0.2
         self.lambda_depth = 0.0
     
@@ -87,7 +87,7 @@ if __name__ == "__main__":
     raw_points = points.random_sample(2**14)
     # raw_points.write_ply(open('points.ply', 'wb'))
 
-    gaussModel = GaussModel(sh_degree=4, debug=False)
+    gaussModel = Gauss2DModel(sh_degree=4, debug=False)
     gaussModel.create_from_pcd(pcd=raw_points)
     
     render_kwargs = {

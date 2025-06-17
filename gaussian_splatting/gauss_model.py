@@ -7,7 +7,7 @@ from gaussian_splatting.utils.point_utils import PointCloud
 from gaussian_splatting.gauss_render import strip_symmetric, inverse_sigmoid, build_scaling_rotation
 from gaussian_splatting.utils.sh_utils import RGB2SH
 
-class GaussModel(nn.Module):
+class Gauss2DModel(nn.Module):
     """
     A Gaussian Model
 
@@ -24,11 +24,13 @@ class GaussModel(nn.Module):
     >>> out = gaussRender(pc=gaussModel, camera=camera)
     """
     def setup_functions(self):
-        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-            actual_covariance = L @ L.transpose(1, 2)
-            symm = strip_symmetric(actual_covariance)
-            return symm
+        def build_covariance_from_scaling_rotation(center, scaling, scaling_modifier, rotation):
+            RS = build_scaling_rotation(torch.cat([scaling * scaling_modifier, torch.ones_like(scaling)], dim=-1), rotation).permute(0,2,1)
+            trans = torch.zeros((center.shape[0], 4, 4), dtype=torch.float, device="cuda")
+            trans[:,:3,:3] = RS
+            trans[:, 3,:3] = center
+            trans[:, 3, 3] = 1
+            return trans
         
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -41,7 +43,7 @@ class GaussModel(nn.Module):
         self.rotation_activation = torch.nn.functional.normalize
     
     def __init__(self, sh_degree : int=3, debug=False):
-        super(GaussModel, self).__init__()
+        super(Gauss2DModel, self).__init__()
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
@@ -69,7 +71,7 @@ class GaussModel(nn.Module):
         features[:, 3:, 1:] = 0.0
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
@@ -78,7 +80,7 @@ class GaussModel(nn.Module):
             # easy for visualization
             colors = np.zeros_like(colors)
             opacities = inverse_sigmoid(0.9 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-
+    
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -111,7 +113,7 @@ class GaussModel(nn.Module):
         return self.opacity_activation(self._opacity)
     
     def get_covariance(self, scaling_modifier = 1):
-        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+        return self.covariance_activation(self.get_xyz, self.get_scaling, scaling_modifier, self._rotation)
 
     def save_ply(self, path):
         from plyfile import PlyData, PlyElement
