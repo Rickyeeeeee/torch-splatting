@@ -34,15 +34,31 @@ class GSSTrainer(Trainer):
             camera = to_viewpoint_camera(camera)
 
         if USE_PROFILE:
-            prof = profile(activities=[ProfilerActivity.CUDA], with_stack=True)
+            prof = profile(
+                activities=[
+                    ProfilerActivity.CPU,
+                    ProfilerActivity.CUDA], 
+                schedule=torch.profiler.schedule(wait=0, warmup=0, active=2),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler('./log'),
+                record_shapes=True,
+                with_flops=True,
+                profile_memory=True,
+                with_stack=True)
         else:
             prof = contextlib.nullcontext()
 
         with prof:
             out = self.gaussRender(pc=self.model, camera=camera)
 
-        if USE_PROFILE:
-            print(prof.key_averages(group_by_stack_n=True).table(sort_by='self_cuda_time_total', row_limit=20))
+            if USE_PROFILE:
+                prof.step()  # Step the profiler to record the next iteration
+                for evt in prof.key_averages(group_by_stack_n=5):  # Adjust the number as needed
+                    print(evt.key)
+                    print(evt.stack())  # prints the Python stack trace
+        # if USE_PROFILE:
+        #     with open("profile_output.txt", "w") as f:
+        #         f.write(prof.key_averages(group_by_stack_n=True).table(sort_by='self_cuda_time_total', row_limit=20))
+
 
 
         l1_loss = loss_utils.l1_loss(out['render'], rgb)
